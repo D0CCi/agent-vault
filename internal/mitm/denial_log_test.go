@@ -53,12 +53,43 @@ func TestDenialLogAdmitBoundsKeys(t *testing.T) {
 		t.Fatalf("len(seen) = %d, want 1 after pruning expired entries", got)
 	}
 
-	// All entries live: the map resets instead of growing past the cap.
-	for i := 0; i < denialLogMaxKeys; i++ {
+	// Fill the map with live keys.
+	for i := 1; i < denialLogMaxKeys; i++ {
 		l.admit(fmt.Sprintf("mitm:live-%d", i), later)
 	}
-	if got := len(l.seen); got > denialLogMaxKeys {
-		t.Fatalf("len(seen) = %d, exceeds cap %d", got, denialLogMaxKeys)
+	// A key that was already logged stays throttled when the map is full.
+	if ok, _ := l.admit("mitm:new", later.Add(time.Second)); ok {
+		t.Fatal("live key lost its throttle window when the map filled up")
+	}
+	// New keys share one overflow bucket: one line per interval between them.
+	logged := 0
+	for i := 0; i < 100; i++ {
+		if ok, _ := l.admit(fmt.Sprintf("mitm:flood-%d", i), later.Add(2*time.Second)); ok {
+			logged++
+		}
+	}
+	if logged != 1 {
+		t.Fatalf("overflow keys logged %d lines, want 1 per interval", logged)
+	}
+	if got := len(l.seen); got > denialLogMaxKeys+1 {
+		t.Fatalf("len(seen) = %d, exceeds cap %d (+overflow)", got, denialLogMaxKeys)
+	}
+	// Once the live keys expire, pruning frees room for per-key entries again.
+	if ok, _ := l.admit("mitm:flood-x", later.Add(2*time.Second+denialLogInterval)); !ok {
+		t.Fatal("new key should be admitted after live keys expire")
+	}
+	if _, own := l.seen["mitm:flood-x"]; !own {
+		t.Fatal("expected flood-x to get its own entry after pruning")
+	}
+}
+
+func TestTruncateForLog(t *testing.T) {
+	if got := truncateForLog("example.com:443", maxLoggedTargetLen); got != "example.com:443" {
+		t.Fatalf("short value changed: %q", got)
+	}
+	long := strings.Repeat("a", 1<<20)
+	if got := truncateForLog(long, maxLoggedTargetLen); len(got) > maxLoggedTargetLen+len("...(truncated)") {
+		t.Fatalf("truncated length = %d", len(got))
 	}
 }
 
