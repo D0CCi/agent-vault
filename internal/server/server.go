@@ -1089,8 +1089,14 @@ func (s *Server) Start() error {
 	// AES-GCM never reads a zeroed s.encKey (silently produces garbage
 	// ciphertext that lands in the credentials table).
 	syncerDone := make(chan struct{})
-	if s.infisicalSyncer == nil && s.infisicalClient != nil {
-		s.infisicalSyncer = infisical.NewSyncer(s.store, s.infisicalClient, s.encKey, s.logger)
+	// Built even without a client: a fetcher-less syncer marks Infisical-backed
+	// vaults as not refreshing instead of leaving a stale "ok" in place.
+	if s.infisicalSyncer == nil {
+		var fetcher infisical.SecretsFetcher
+		if s.infisicalClient != nil {
+			fetcher = s.infisicalClient // avoid a typed-nil interface
+		}
+		s.infisicalSyncer = infisical.NewSyncer(s.store, fetcher, s.encKey, s.logger)
 	}
 	if s.infisicalSyncer != nil {
 		go func() {

@@ -406,3 +406,73 @@ func TestSyncerWaitGroupDrainsInflightRefreshes(t *testing.T) {
 		t.Fatalf("wg.Wait did not return after the in-flight refresh finished")
 	}
 }
+
+// A server without an Infisical client must not keep reporting a stale "ok"
+// for external-store vaults it will never refresh (#425).
+func TestSyncerRun_NoFetcherMarksInfisicalVaultsError(t *testing.T) {
+	connectedAt := time.Now().Add(-96 * time.Hour).UTC().Truncate(time.Second)
+	fs := newFakeStore(
+		store.VaultCredentialStore{
+			VaultID:        "v1",
+			Kind:           store.CredentialStoreInfisical,
+			ConfigJSON:     `{"project_id":"p","environment":"dev","secret_path":"/"}`,
+			LastSyncedAt:   &connectedAt,
+			LastSyncStatus: store.SyncStatusOK,
+		},
+		store.VaultCredentialStore{
+			VaultID:        "v2",
+			Kind:           "other",
+			LastSyncStatus: store.SyncStatusOK,
+		},
+	)
+	s := NewSyncer(fs, nil, makeDEK(t), newDiscardLogger())
+
+	s.Run(context.Background()) // returns immediately without a fetcher
+
+	h := fs.getHealth("v1")
+	if h.Status != store.SyncStatusError {
+		t.Fatalf("v1 status = %q, want %q", h.Status, store.SyncStatusError)
+	}
+	if h.Error != syncDisabledPublicMessage {
+		t.Fatalf("v1 error = %q, want %q", h.Error, syncDisabledPublicMessage)
+	}
+	if !h.When.Equal(connectedAt) {
+		t.Fatalf("last_synced_at advanced to %v, want preserved %v", h.When, connectedAt)
+	}
+	if _, touched := fs.health["v2"]; touched {
+		t.Fatal("non-infisical store row must not be touched")
+	}
+}
+
+func TestSyncerRun_NoFetcherSkipsAlreadyMarkedRows(t *testing.T) {
+	fs := newFakeStore(store.VaultCredentialStore{
+		VaultID:        "v1",
+		Kind:           store.CredentialStoreInfisical,
+		LastSyncStatus: store.SyncStatusError,
+		LastSyncError:  syncDisabledPublicMessage,
+	})
+	s := NewSyncer(fs, nil, makeDEK(t), newDiscardLogger())
+
+	s.Run(context.Background())
+
+	if _, touched := fs.health["v1"]; touched {
+		t.Fatal("row already marked disabled should not be rewritten")
+	}
+}
+
+func TestSyncerRun_NoFetcherNeverSyncedUsesNow(t *testing.T) {
+	fs := newFakeStore(store.VaultCredentialStore{
+		VaultID:        "v1",
+		Kind:           store.CredentialStoreInfisical,
+		LastSyncStatus: store.SyncStatusOK,
+	})
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	s := NewSyncer(fs, nil, makeDEK(t), newDiscardLogger())
+	s.clock = func() time.Time { return now }
+
+	s.Run(context.Background())
+
+	if h := fs.getHealth("v1"); h.Status != store.SyncStatusError || !h.When.Equal(now) {
+		t.Fatalf("got %+v, want status=error when=%v", h, now)
+	}
+}
