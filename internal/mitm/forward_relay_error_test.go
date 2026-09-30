@@ -13,21 +13,25 @@ import (
 )
 
 // When the upstream dies mid-body, the relay must surface it: the client
-// sees a failed read (not a clean, silently truncated body) and the request
-// log carries a non-empty error_code (#362 follow-up).
+// receives the bytes streamed so far and then a failed read (not a clean,
+// silently truncated body), and the request log carries a non-empty
+// error_code (#362 follow-up).
 func TestMITMForwardUpstreamBodyFailureIsSurfaced(t *testing.T) {
+	const partial = "partial-body"
+	chunked := "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\nc\r\n" + partial + "\r\n"
 	cases := []struct {
-		name string
-		raw  string // written verbatim before the upstream drops the connection
+		name     string
+		raw      string // written verbatim before the upstream drops the connection
+		maxBytes int64  // proxy response cap; 0 = unlimited
 	}{
 		{
 			name: "content-length",
-			raw:  "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 100\r\n\r\npartial-body",
+			raw:  "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 100\r\n\r\n" + partial,
 		},
-		{
-			name: "chunked",
-			raw:  "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\nc\r\npartial-body\r\n",
-		},
+		{name: "chunked", raw: chunked},
+		// The upstream dies exactly at the cap: the capped copy stops before
+		// the error, so the post-cap probe must catch it.
+		{name: "chunked at response cap", raw: chunked, maxBytes: int64(len(partial))},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -52,13 +56,20 @@ func TestMITMForwardUpstreamBodyFailureIsSurfaced(t *testing.T) {
 				}},
 			}}
 			sink := &recordingSink{}
-			proxyURL, clientRoots, _ := setupProxy(t, sr, cp, func(o *Options) { o.LogSink = sink })
+			proxyURL, clientRoots, _ := setupProxy(t, sr, cp, func(o *Options) {
+				o.LogSink = sink
+				o.MaxResponseBytes = tc.maxBytes
+			})
 			client := newTrustingClient(proxyURL, url.User("av_sess_ok"), clientRoots)
 
 			resp, err := client.Get(upstream.URL + "/stream")
-			if err == nil {
-				_, err = io.ReadAll(resp.Body)
-				resp.Body.Close()
+			if err != nil {
+				t.Fatalf("client.Get: %v (want a response, then a failing body read)", err)
+			}
+			got, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if string(got) != partial {
+				t.Fatalf("client received %q before the failure, want %q", got, partial)
 			}
 			if err == nil {
 				t.Fatal("client read the truncated body without error; truncation must be visible")

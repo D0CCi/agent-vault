@@ -425,6 +425,22 @@ func (p *Proxy) forwardRequest(
 	}
 	n, _ := io.Copy(dst, src)
 
+	// At the cap, probe for more body. The probe goes through relayBody so
+	// an upstream that dies exactly at the cap is caught below.
+	if p.maxResponseBytes > 0 && n == p.maxResponseBytes {
+		var probe [1]byte
+		if extra, _ := relayBody.Read(probe[:]); extra > 0 {
+			p.logger.Warn("response body truncated mid-stream, aborting connection",
+				slog.String("host", target),
+				slog.String("path", r.URL.Path),
+				slog.Int64("bytes_streamed", n),
+				slog.Int64("max_response_bytes", p.maxResponseBytes),
+			)
+			emit(resp.StatusCode, "response_truncated")
+			panic(http.ErrAbortHandler)
+		}
+	}
+
 	// The upstream failed mid-body. Abort instead of returning: a clean
 	// return would terminate a chunked response normally, and the client
 	// would take the truncated body as complete.
@@ -437,20 +453,6 @@ func (p *Proxy) forwardRequest(
 		)
 		emit(resp.StatusCode, "upstream_body_error")
 		panic(http.ErrAbortHandler)
-	}
-
-	if p.maxResponseBytes > 0 && n == p.maxResponseBytes {
-		var probe [1]byte
-		if extra, _ := resp.Body.Read(probe[:]); extra > 0 {
-			p.logger.Warn("response body truncated mid-stream, aborting connection",
-				slog.String("host", target),
-				slog.String("path", r.URL.Path),
-				slog.Int64("bytes_streamed", n),
-				slog.Int64("max_response_bytes", p.maxResponseBytes),
-			)
-			emit(resp.StatusCode, "response_truncated")
-			panic(http.ErrAbortHandler)
-		}
 	}
 
 	emit(resp.StatusCode, "")
