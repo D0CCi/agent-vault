@@ -43,6 +43,7 @@ type fakeStore struct {
 	replaceCh chan map[string][]store.EncryptedKV // capture each credential write per vault
 	health    map[string]healthRow
 	repErr    error
+	healthErr error
 }
 
 type healthRow struct {
@@ -90,6 +91,9 @@ func (f *fakeStore) ReplaceVaultCredentialsForSync(_ context.Context, vaultID, c
 func (f *fakeStore) UpdateVaultCredentialStoreHealth(_ context.Context, vaultID, status, errMsg string, when time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.healthErr != nil {
+		return f.healthErr
+	}
 	f.health[vaultID] = healthRow{Status: status, Error: errMsg, When: when}
 	// Reflect the update back onto the rows so subsequent ticks see the new last_synced_at.
 	for i := range f.rows {
@@ -427,7 +431,7 @@ func TestSyncerRun_NoFetcherMarksInfisicalVaultsError(t *testing.T) {
 	)
 	s := NewSyncer(fs, nil, makeDEK(t), newDiscardLogger())
 
-	s.Run(context.Background()) // returns immediately without a fetcher
+	s.Run(canceledCtx()) // one pass, then returns on the cancelled ctx
 
 	h := fs.getHealth("v1")
 	if h.Status != store.SyncStatusError {
@@ -453,7 +457,7 @@ func TestSyncerRun_NoFetcherSkipsAlreadyMarkedRows(t *testing.T) {
 	})
 	s := NewSyncer(fs, nil, makeDEK(t), newDiscardLogger())
 
-	s.Run(context.Background())
+	s.Run(canceledCtx())
 
 	if _, touched := fs.health["v1"]; touched {
 		t.Fatal("row already marked disabled should not be rewritten")
@@ -470,9 +474,68 @@ func TestSyncerRun_NoFetcherNeverSyncedUsesNow(t *testing.T) {
 	s := NewSyncer(fs, nil, makeDEK(t), newDiscardLogger())
 	s.clock = func() time.Time { return now }
 
-	s.Run(context.Background())
+	s.Run(canceledCtx())
 
 	if h := fs.getHealth("v1"); h.Status != store.SyncStatusError || !h.When.Equal(now) {
 		t.Fatalf("got %+v, want status=error when=%v", h, now)
+	}
+}
+
+func canceledCtx() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
+}
+
+// With a shared Postgres, another replica that has a client keeps the row
+// fresh; a client-less replica must not overwrite that healthy status.
+func TestSyncerRun_NoFetcherLeavesRecentlySyncedRows(t *testing.T) {
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	syncedAt := now.Add(-90 * time.Second) // < 2 × 60s poll interval
+	fs := newFakeStore(store.VaultCredentialStore{
+		VaultID:             "v1",
+		Kind:                store.CredentialStoreInfisical,
+		PollIntervalSeconds: 60,
+		LastSyncedAt:        &syncedAt,
+		LastSyncStatus:      store.SyncStatusOK,
+	})
+	s := NewSyncer(fs, nil, makeDEK(t), newDiscardLogger())
+	s.clock = func() time.Time { return now }
+
+	s.Run(canceledCtx())
+
+	if _, touched := fs.health["v1"]; touched {
+		t.Fatal("row refreshed within two poll intervals must not be marked")
+	}
+
+	// Once it goes overdue (the healthy replica stopped), it is flagged.
+	s.clock = func() time.Time { return now.Add(time.Minute) }
+	s.markStale(context.Background())
+	if h := fs.getHealth("v1"); h.Status != store.SyncStatusError || !h.When.Equal(syncedAt) {
+		t.Fatalf("got %+v, want status=error when=%v", h, syncedAt)
+	}
+}
+
+// Every tick re-runs markStale, so a transient write failure is retried.
+func TestSyncerMarkStale_RetriesAfterWriteFailure(t *testing.T) {
+	fs := newFakeStore(store.VaultCredentialStore{
+		VaultID:        "v1",
+		Kind:           store.CredentialStoreInfisical,
+		LastSyncStatus: store.SyncStatusOK,
+	})
+	fs.healthErr = errors.New("database is locked")
+	s := NewSyncer(fs, nil, makeDEK(t), newDiscardLogger())
+
+	s.markStale(context.Background())
+	if _, touched := fs.health["v1"]; touched {
+		t.Fatal("failed write must not record health")
+	}
+
+	fs.mu.Lock()
+	fs.healthErr = nil
+	fs.mu.Unlock()
+	s.markStale(context.Background())
+	if h := fs.getHealth("v1"); h.Status != store.SyncStatusError {
+		t.Fatalf("status after retry = %q, want error", h.Status)
 	}
 }
