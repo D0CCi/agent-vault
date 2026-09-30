@@ -1,12 +1,15 @@
 package mitm
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -136,5 +139,70 @@ func TestMITMForward401RetrySuccessRelaysRetry(t *testing.T) {
 	}
 	if n := calls.Load(); n != 2 {
 		t.Errorf("upstream saw %d requests, want 2", n)
+	}
+}
+
+// seqCredProvider returns its results in order (the last one repeats), so a
+// test can make the retry injection differ from the first one.
+type seqCredProvider struct {
+	mu      sync.Mutex
+	results []fakeInjectResult
+	calls   int
+}
+
+func (s *seqCredProvider) Inject(context.Context, string, string, int, string) (*brokercore.InjectResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res := s.results[min(s.calls, len(s.results)-1)]
+	s.calls++
+	return res.result, res.err
+}
+
+// If the retry injection fails or yields no headers, no retry is sent and
+// the original 401 is relayed intact.
+func TestMITMForward401RetryInjectionUnusableRelaysOriginal(t *testing.T) {
+	first := fakeInjectResult{result: &brokercore.InjectResult{
+		MatchedName: "api",
+		Headers:     map[string]string{"Authorization": "Bearer stale"},
+	}}
+	for name, retry := range map[string]fakeInjectResult{
+		"error":      {err: errors.New("refresh failed")},
+		"no headers": {result: &brokercore.InjectResult{MatchedName: "api"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			upstream, _, calls := start401Upstream(t, nil)
+			cp := &seqCredProvider{results: []fakeInjectResult{first, retry}}
+
+			status, body, _ := get401ThroughProxy(t, cp, upstream.URL+"/v1/me")
+
+			if status != http.StatusUnauthorized || body != upstream401Body {
+				t.Fatalf("got %d %q, want the original 401 body", status, body)
+			}
+			if n := calls.Load(); n != 1 {
+				t.Errorf("upstream saw %d requests, want 1 (no usable retry credential)", n)
+			}
+		})
+	}
+}
+
+// A successful retry carries the refreshed credential, not the stale one.
+func TestMITMForward401RetrySendsRefreshedHeaders(t *testing.T) {
+	var retryAuth atomic.Value
+	upstream, _, _ := start401Upstream(t, func(w http.ResponseWriter, r *http.Request) {
+		retryAuth.Store(r.Header.Get("Authorization"))
+		_, _ = io.WriteString(w, "refreshed-ok")
+	})
+	cp := &seqCredProvider{results: []fakeInjectResult{
+		{result: &brokercore.InjectResult{MatchedName: "api", Headers: map[string]string{"Authorization": "Bearer stale"}}},
+		{result: &brokercore.InjectResult{MatchedName: "api", Headers: map[string]string{"Authorization": "Bearer fresh"}}},
+	}}
+
+	status, body, _ := get401ThroughProxy(t, cp, upstream.URL+"/v1/me")
+
+	if status != http.StatusOK || body != "refreshed-ok" {
+		t.Fatalf("got %d %q, want 200 \"refreshed-ok\"", status, body)
+	}
+	if got, _ := retryAuth.Load().(string); got != "Bearer fresh" {
+		t.Errorf("retry Authorization = %q, want the refreshed credential", got)
 	}
 }
